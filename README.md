@@ -39,6 +39,28 @@ Add your API key to `.env`:
 OPENAI_API_KEY=...
 ```
 
+Performance tuning (faster responses):
+
+```bash
+OPENAI_TIMEOUT_SECONDS=25
+OPENAI_MAX_IMAGE_SIDE=1800
+OPENAI_CONCURRENCY=2
+KOSI_STEP_WORKERS=3
+KOSI_MAX_STEP_TARGETS=4
+```
+
+The app also prints live progress as step highlight images finish.
+
+Optional detection mode:
+
+```bash
+KOSI_DETECTOR_MODE=recognize_everything
+KOSI_EVERYTHING_MAX_TAGS=24
+RAM_CHECKPOINT_PATH=/absolute/path/to/ram_swin_large_14m.pth
+```
+
+In `recognize_everything` mode, the app enriches detection with Recognize-Anything tags (RAM when checkpoint is available, plus GPT visual tags) while keeping the same YOLO + GPT boxing flow.
+
 ## Run
 
 Interactive mode:

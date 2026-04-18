@@ -26,8 +26,13 @@ class YoloDetector:
             self._fallback_model = None
         self._confidence_threshold = confidence_threshold
 
-    def detect(self, image_path: Path, issue_text: str = "") -> list[Detection]:
-        classes = _build_world_classes(issue_text)
+    def detect(
+        self,
+        image_path: Path,
+        issue_text: str = "",
+        extra_terms: list[str] | None = None,
+    ) -> list[Detection]:
+        classes = _build_world_classes(issue_text=issue_text, extra_terms=extra_terms or [])
         return self._predict(image_path=image_path, world_classes=classes, allow_fallback=True)
 
     def detect_for_terms(self, image_path: Path, terms: list[str]) -> list[Detection]:
@@ -102,8 +107,9 @@ def _resolve_label(names, cls_id: int) -> str:
     return str(cls_id)
 
 
-def _build_world_classes(issue_text: str) -> list[str]:
+def _build_world_classes(issue_text: str, extra_terms: list[str]) -> list[str]:
     classes = build_query_terms(issue_text.strip().lower())
+    classes.extend(extra_terms)
     return _dedupe_terms(classes)
 
 

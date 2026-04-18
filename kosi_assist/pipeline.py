@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import shutil
 import sys
+import threading
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image
 from rapidfuzz import fuzz
@@ -16,10 +19,19 @@ from kosi_assist.detector import YoloDetector
 from kosi_assist.image_utils import crop_detection, draw_detection_box
 from kosi_assist.llm_client import GuidanceClient, build_guidance_client
 from kosi_assist.matcher import is_electronics_label, label_match_score, select_best_detection
+from kosi_assist.recognizer import RecognizeEverything
 from kosi_assist.types import Detection, PipelineResult, StepTarget
 
 
-def run_pipeline(image_path: Path, issue_text: str, config: AppConfig) -> PipelineResult:
+_THREAD_LOCAL = threading.local()
+
+
+def run_pipeline(
+    image_path: Path,
+    issue_text: str,
+    config: AppConfig,
+    progress_callback: Callable[[str], None] | None = None,
+) -> PipelineResult:
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
@@ -27,18 +39,42 @@ def run_pipeline(image_path: Path, issue_text: str, config: AppConfig) -> Pipeli
         model_name=config.yolo_model,
         confidence_threshold=config.yolo_confidence,
     )
-    detections = detector.detect(image_path=image_path, issue_text=issue_text)
-    if not detections:
-        raise ValueError(
-            "No objects detected. Please retake the photo with better lighting and keep the target device centered."
-        )
-
     guidance_client = build_guidance_client(
         backend=config.llm_backend,
         openai_api_key=config.openai_api_key,
         openai_model=config.openai_model,
+        openai_timeout_seconds=config.openai_timeout_seconds,
+        openai_max_image_side=config.openai_max_image_side,
+        openai_concurrency=config.openai_concurrency,
         local_model_name=config.local_vlm_model,
     )
+
+    recognition_tags: list[str] = []
+    detect_issue_text = issue_text
+    if config.detector_mode == "recognize_everything":
+        recognizer = RecognizeEverything(
+            checkpoint_path=config.ram_checkpoint,
+            max_tags=config.everything_max_tags,
+        )
+        recognition_tags = recognizer.collect_tags(
+            image_path=image_path,
+            issue_text=issue_text,
+            guidance_client=guidance_client,
+        )
+        if recognition_tags:
+            _emit_progress(
+                progress_callback,
+                f"Recognize-everything tags: {', '.join(recognition_tags[:10])}",
+            )
+    detections = detector.detect(
+        image_path=image_path,
+        issue_text=detect_issue_text,
+        extra_terms=recognition_tags,
+    )
+    if not detections:
+        raise ValueError(
+            "No objects detected. Please retake the photo with better lighting and keep the target device centered."
+        )
 
     selected = select_best_detection(issue_text=issue_text, detections=detections)
     selection_method = "heuristic"
@@ -94,8 +130,13 @@ def run_pipeline(image_path: Path, issue_text: str, config: AppConfig) -> Pipeli
         issue_text=issue_text,
         target_label=selected.label,
     )
+    _emit_progress(progress_callback, "Generated text instructions")
 
-    step_targets = guidance_client.extract_step_targets(instructions)
+    step_targets = _prune_step_targets(
+        guidance_client.extract_step_targets(instructions),
+        max_targets=config.max_step_targets,
+    )
+    _emit_progress(progress_callback, f"Preparing visual highlights for {len(step_targets)} steps")
 
     reply_dir = config.reply_dir
     _reset_reply_dir(reply_dir)
@@ -103,54 +144,80 @@ def run_pipeline(image_path: Path, issue_text: str, config: AppConfig) -> Pipeli
     unfound_targets: list[str] = []
     visual_results: list[dict] = []
 
-    for step_target in step_targets:
-        located = _locate_target_for_step(
-            detector=detector,
-            guidance_client=guidance_client,
-            step_target=step_target,
+    step_results: list[dict] = []
+    worker_count = max(1, min(config.step_workers, max(1, len(step_targets))))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                _process_step_target,
+                step_target=step_target,
+                config=config,
+                guidance_client=guidance_client,
+                cropped_path=gpt_input_path,
+                full_image_path=image_path,
+                cropped_anchor=cropped_anchor,
+                full_anchor=full_anchor,
+                cropped_size=cropped_size,
+                full_size=full_size,
+                reply_dir=reply_dir,
+            ): step_target
+            for step_target in step_targets
+        }
+
+        for future in as_completed(futures):
+            result = future.result()
+            step_results.append(result)
+            if result["found"]:
+                _emit_progress(
+                    progress_callback,
+                    (
+                        f"Step {result['step_number']} image ready: "
+                        f"{result['reply_image']}"
+                    ),
+                )
+            else:
+                _emit_progress(
+                    progress_callback,
+                    (
+                        f"Step {result['step_number']} unfound target: "
+                        f"{result['visual_target']}"
+                    ),
+                )
+
+    step_results.sort(key=lambda item: (item["step_number"], item["visual_target"]))
+    for result in step_results:
+        if result["found"]:
+            reply_images.append(Path(result["reply_image"]))
+        else:
+            unfound_targets.append(result["visual_target"])
+        visual_results.append(result)
+
+    desired_reply_count = 1 if len(step_targets) <= 1 else 2
+    if len(reply_images) < desired_reply_count and step_targets:
+        missing = desired_reply_count - len(reply_images)
+        best_effort = _generate_best_effort_replies(
+            missing_count=missing,
+            step_targets=step_targets,
+            existing_reply_images=reply_images,
+            config=config,
             cropped_path=gpt_input_path,
             full_image_path=image_path,
             cropped_anchor=cropped_anchor,
             full_anchor=full_anchor,
             cropped_size=cropped_size,
             full_size=full_size,
+            reply_dir=reply_dir,
         )
-        if not located:
-            unfound_targets.append(step_target.visual_target)
-            visual_results.append(
-                {
-                    "step_number": step_target.step_number,
-                    "instruction": step_target.instruction,
-                    "visual_target": step_target.visual_target,
-                    "found": False,
-                }
+        for item in best_effort:
+            reply_images.append(Path(item["reply_image"]))
+            visual_results.append(item)
+            target_name = item["visual_target"]
+            if target_name in unfound_targets:
+                unfound_targets.remove(target_name)
+            _emit_progress(
+                progress_callback,
+                f"Best-effort image ready for step {item['step_number']}: {item['reply_image']}",
             )
-            continue
-
-        detection, source_key, source_path = located
-        reply_name = (
-            f"step_{step_target.step_number:02d}_"
-            f"{_slugify(step_target.visual_target)}_{source_key}.jpg"
-        )
-        reply_path = reply_dir / reply_name
-        draw_detection_box(
-            image_path=source_path,
-            detection=detection,
-            output_path=reply_path,
-            label_text=step_target.visual_target,
-        )
-        reply_images.append(reply_path)
-        visual_results.append(
-            {
-                "step_number": step_target.step_number,
-                "instruction": step_target.instruction,
-                "visual_target": step_target.visual_target,
-                "found": True,
-                "source": source_key,
-                "reply_image": str(reply_path),
-                "detection": detection.to_dict(),
-            }
-        )
 
     report_path = report_dir / f"report_{timestamp}.json"
     report = {
@@ -167,6 +234,8 @@ def run_pipeline(image_path: Path, issue_text: str, config: AppConfig) -> Pipeli
         "unfound_targets": unfound_targets,
         "visual_results": visual_results,
         "selection_method": selection_method,
+        "detector_mode": config.detector_mode,
+        "recognition_tags": recognition_tags,
         "llm_backend": config.llm_backend,
         "openai_model": config.openai_model,
     }
@@ -238,6 +307,323 @@ def _reset_reply_dir(reply_dir: Path) -> None:
             entry.unlink()
 
 
+def _emit_progress(progress_callback: Callable[[str], None] | None, message: str) -> None:
+    if progress_callback is not None:
+        progress_callback(message)
+
+
+def _prune_step_targets(step_targets: list[StepTarget], max_targets: int) -> list[StepTarget]:
+    if max_targets <= 0:
+        return []
+
+    ordered = sorted(step_targets, key=lambda s: (s.step_number, len(s.visual_target)))
+    pruned: list[StepTarget] = []
+    seen: set[tuple[int, str]] = set()
+    for step in ordered:
+        canonical = _canonical_target(step.visual_target)
+        key = (step.step_number, canonical)
+        if key in seen:
+            continue
+        seen.add(key)
+        pruned.append(step)
+        if len(pruned) >= max_targets:
+            break
+    return pruned
+
+
+def _process_step_target(
+    step_target: StepTarget,
+    config: AppConfig,
+    guidance_client: GuidanceClient,
+    cropped_path: Path,
+    full_image_path: Path,
+    cropped_anchor: Detection,
+    full_anchor: Detection,
+    cropped_size: tuple[int, int],
+    full_size: tuple[int, int],
+    reply_dir: Path,
+) -> dict:
+    detector = _get_thread_detector(
+        model_name=config.yolo_model,
+        confidence_threshold=config.yolo_confidence,
+    )
+    located = _locate_target_for_step(
+        detector=detector,
+        guidance_client=guidance_client,
+        step_target=step_target,
+        cropped_path=cropped_path,
+        full_image_path=full_image_path,
+        cropped_anchor=cropped_anchor,
+        full_anchor=full_anchor,
+        cropped_size=cropped_size,
+        full_size=full_size,
+    )
+    if not located:
+        return {
+            "step_number": step_target.step_number,
+            "instruction": step_target.instruction,
+            "visual_target": step_target.visual_target,
+            "found": False,
+        }
+
+    detection, source_key, source_path = located
+    reply_name = (
+        f"step_{step_target.step_number:02d}_"
+        f"{_slugify(step_target.visual_target)}_{source_key}.jpg"
+    )
+    reply_path = reply_dir / reply_name
+    draw_detection_box(
+        image_path=source_path,
+        detection=detection,
+        output_path=reply_path,
+        label_text=step_target.visual_target,
+    )
+
+    return {
+        "step_number": step_target.step_number,
+        "instruction": step_target.instruction,
+        "visual_target": step_target.visual_target,
+        "found": True,
+        "source": source_key,
+        "reply_image": str(reply_path),
+        "detection": detection.to_dict(),
+    }
+
+
+def _generate_best_effort_replies(
+    missing_count: int,
+    step_targets: list[StepTarget],
+    existing_reply_images: list[Path],
+    config: AppConfig,
+    cropped_path: Path,
+    full_image_path: Path,
+    cropped_anchor: Detection,
+    full_anchor: Detection,
+    cropped_size: tuple[int, int],
+    full_size: tuple[int, int],
+    reply_dir: Path,
+) -> list[dict]:
+    if missing_count <= 0:
+        return []
+
+    detector = _get_thread_detector(
+        model_name=config.yolo_model,
+        confidence_threshold=config.yolo_confidence,
+    )
+    produced: list[dict] = []
+    used_reply_names = {p.name for p in existing_reply_images}
+
+    for step_target in step_targets:
+        if len(produced) >= missing_count:
+            break
+
+        candidate = _best_effort_locate_target(
+            detector=detector,
+            step_target=step_target,
+            cropped_path=cropped_path,
+            full_image_path=full_image_path,
+            cropped_anchor=cropped_anchor,
+            full_anchor=full_anchor,
+            cropped_size=cropped_size,
+            full_size=full_size,
+        )
+        if candidate is None:
+            continue
+
+        detection, source_key, source_path = candidate
+        reply_name = (
+            f"step_{step_target.step_number:02d}_"
+            f"{_slugify(step_target.visual_target)}_{source_key}_best_effort.jpg"
+        )
+        if reply_name in used_reply_names:
+            continue
+        used_reply_names.add(reply_name)
+
+        reply_path = reply_dir / reply_name
+        draw_detection_box(
+            image_path=source_path,
+            detection=detection,
+            output_path=reply_path,
+            label_text=f"{step_target.visual_target} (best effort)",
+        )
+        produced.append(
+            {
+                "step_number": step_target.step_number,
+                "instruction": step_target.instruction,
+                "visual_target": step_target.visual_target,
+                "found": True,
+                "source": f"{source_key}_best_effort",
+                "reply_image": str(reply_path),
+                "detection": detection.to_dict(),
+            }
+        )
+
+    return produced
+
+
+def _best_effort_locate_target(
+    detector: YoloDetector,
+    step_target: StepTarget,
+    cropped_path: Path,
+    full_image_path: Path,
+    cropped_anchor: Detection,
+    full_anchor: Detection,
+    cropped_size: tuple[int, int],
+    full_size: tuple[int, int],
+) -> tuple[Detection, str, Path] | None:
+    canonical_target = _canonical_target(step_target.visual_target)
+    terms = _target_terms(canonical_target)
+    scope, zone = _target_scope_and_zone(canonical_target)
+
+    full_detections = detector.detect_for_terms(full_image_path, terms)
+    best_full = _best_detection_for_target(canonical_target, full_detections)
+    if best_full is not None and _validate_best_effort_candidate(
+        candidate=best_full,
+        target=canonical_target,
+        scope=scope,
+        anchor=full_anchor,
+        image_size=full_size,
+    ):
+        return _expand_detection(best_full, full_size, ratio=0.08), "full", full_image_path
+
+    cropped_detections = detector.detect_for_terms(cropped_path, terms)
+    best_cropped = _best_detection_for_target(canonical_target, cropped_detections)
+    if best_cropped is not None and _validate_best_effort_candidate(
+        candidate=best_cropped,
+        target=canonical_target,
+        scope=scope,
+        anchor=cropped_anchor,
+        image_size=cropped_size,
+    ):
+        return _expand_detection(best_cropped, cropped_size, ratio=0.08), "cropped", cropped_path
+
+    hint = _anchor_hint_detection(
+        target=canonical_target,
+        scope=scope,
+        zone=zone,
+        anchor=full_anchor,
+        image_size=full_size,
+    )
+    if hint is not None:
+        return hint, "full_hint", full_image_path
+
+    return None
+
+
+def _validate_best_effort_candidate(
+    candidate: Detection,
+    target: str,
+    scope: str,
+    anchor: Detection,
+    image_size: tuple[int, int],
+) -> bool:
+    image_w, image_h = image_size
+    if candidate.x1 < 0 or candidate.y1 < 0 or candidate.x2 > image_w or candidate.y2 > image_h:
+        return False
+
+    box_w = candidate.x2 - candidate.x1
+    box_h = candidate.y2 - candidate.y1
+    if box_w < 12 or box_h < 12:
+        return False
+
+    area = box_w * box_h
+    image_area = max(1, image_w * image_h)
+    if area > image_area * 0.75:
+        return False
+
+    target_score = label_match_score(target, candidate.label)
+    if target_score < 30:
+        return False
+
+    if scope == "local":
+        if not _is_near_anchor(candidate, anchor, tolerance_ratio=1.8):
+            return False
+
+    if scope == "nearby":
+        if not _is_near_anchor(candidate, anchor, tolerance_ratio=2.2):
+            return False
+
+    return True
+
+
+def _anchor_hint_detection(
+    target: str,
+    scope: str,
+    zone: str,
+    anchor: Detection,
+    image_size: tuple[int, int],
+) -> Detection | None:
+    image_w, image_h = image_size
+    ax1, ay1, ax2, ay2 = anchor.x1, anchor.y1, anchor.x2, anchor.y2
+    aw = max(40, ax2 - ax1)
+    ah = max(40, ay2 - ay1)
+
+    if scope == "local":
+        if zone == "screen_top_left":
+            x1 = ax1 + int(0.02 * aw)
+            y1 = ay1 + int(0.02 * ah)
+            x2 = x1 + int(0.2 * aw)
+            y2 = y1 + int(0.12 * ah)
+        elif zone == "top_right":
+            x1 = ax1 + int(0.72 * aw)
+            y1 = ay1 + int(0.08 * ah)
+            x2 = x1 + int(0.18 * aw)
+            y2 = y1 + int(0.12 * ah)
+        elif zone == "keyboard_area":
+            x1 = ax1 + int(0.18 * aw)
+            y1 = ay1 + int(0.55 * ah)
+            x2 = ax1 + int(0.86 * aw)
+            y2 = ay1 + int(0.88 * ah)
+        elif zone == "screen_area":
+            x1 = ax1 + int(0.08 * aw)
+            y1 = ay1 + int(0.08 * ah)
+            x2 = ax1 + int(0.92 * aw)
+            y2 = ay1 + int(0.52 * ah)
+        else:
+            x1 = ax1 + int(0.1 * aw)
+            y1 = ay1 + int(0.1 * ah)
+            x2 = ax1 + int(0.9 * aw)
+            y2 = ay1 + int(0.9 * ah)
+    elif scope == "nearby":
+        x1 = max(0, ax1 - int(0.2 * aw))
+        y1 = max(0, ay1 + int(0.38 * ah))
+        x2 = min(image_w, ax1 + int(0.2 * aw))
+        y2 = min(image_h, ay1 + int(0.78 * ah))
+    else:
+        return None
+
+    x1 = max(0, min(image_w - 1, x1))
+    y1 = max(0, min(image_h - 1, y1))
+    x2 = max(x1 + 12, min(image_w, x2))
+    y2 = max(y1 + 12, min(image_h, y2))
+
+    return Detection(
+        label=f"{target} (hint)",
+        confidence=0.28,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+    )
+
+
+def _get_thread_detector(model_name: str, confidence_threshold: float) -> YoloDetector:
+    key = (model_name, confidence_threshold)
+    cached = getattr(_THREAD_LOCAL, "detector_cache", None)
+    if cached is None:
+        cached = {}
+        _THREAD_LOCAL.detector_cache = cached
+
+    detector = cached.get(key)
+    if detector is None:
+        detector = YoloDetector(
+            model_name=model_name,
+            confidence_threshold=confidence_threshold,
+        )
+        cached[key] = detector
+    return detector
+
+
 def _locate_target_for_step(
     detector: YoloDetector,
     guidance_client: GuidanceClient,
@@ -279,34 +665,6 @@ def _locate_target_for_step(
         if finalized is not None:
             return finalized, "cropped", cropped_path
 
-    gpt_cropped = guidance_client.locate_visual_target(
-        image_path=cropped_path,
-        visual_target=step_target.visual_target,
-    )
-    if gpt_cropped is not None and _validate_candidate(
-        candidate=gpt_cropped,
-        target=canonical_target,
-        scope=scope,
-        zone=zone,
-        anchor=cropped_anchor,
-        image_size=cropped_size,
-        source_key="cropped_gpt",
-    ):
-        finalized = _finalize_candidate(
-            guidance_client=guidance_client,
-            candidate=gpt_cropped,
-            target=canonical_target,
-            instruction=step_target.instruction,
-            anchor=cropped_anchor,
-            image_size=cropped_size,
-            scope=scope,
-            zone=zone,
-            source_key="cropped_gpt",
-            source_path=cropped_path,
-        )
-        if finalized is not None:
-            return finalized, "cropped_gpt", cropped_path
-
     full_detections = detector.detect_for_terms(full_image_path, terms)
     best_full = _best_detection_for_target(canonical_target, full_detections)
     if best_full is not None and _validate_candidate(
@@ -333,33 +691,62 @@ def _locate_target_for_step(
         if finalized is not None:
             return finalized, "full", full_image_path
 
-    gpt_full = guidance_client.locate_visual_target(
-        image_path=full_image_path,
-        visual_target=step_target.visual_target,
-    )
-    if gpt_full is not None and _validate_candidate(
-        candidate=gpt_full,
-        target=canonical_target,
-        scope=scope,
-        zone=zone,
-        anchor=full_anchor,
-        image_size=full_size,
-        source_key="full_gpt",
-    ):
-        finalized = _finalize_candidate(
-            guidance_client=guidance_client,
-            candidate=gpt_full,
+    if scope == "local":
+        gpt_cropped = guidance_client.locate_visual_target(
+            image_path=cropped_path,
+            visual_target=step_target.visual_target,
+        )
+        if gpt_cropped is not None and _validate_candidate(
+            candidate=gpt_cropped,
             target=canonical_target,
-            instruction=step_target.instruction,
-            anchor=full_anchor,
-            image_size=full_size,
             scope=scope,
             zone=zone,
-            source_key="full_gpt",
-            source_path=full_image_path,
+            anchor=cropped_anchor,
+            image_size=cropped_size,
+            source_key="cropped_gpt",
+        ):
+            finalized = _finalize_candidate(
+                guidance_client=guidance_client,
+                candidate=gpt_cropped,
+                target=canonical_target,
+                instruction=step_target.instruction,
+                anchor=cropped_anchor,
+                image_size=cropped_size,
+                scope=scope,
+                zone=zone,
+                source_key="cropped_gpt",
+                source_path=cropped_path,
+            )
+            if finalized is not None:
+                return finalized, "cropped_gpt", cropped_path
+    else:
+        gpt_full = guidance_client.locate_visual_target(
+            image_path=full_image_path,
+            visual_target=step_target.visual_target,
         )
-        if finalized is not None:
-            return finalized, "full_gpt", full_image_path
+        if gpt_full is not None and _validate_candidate(
+            candidate=gpt_full,
+            target=canonical_target,
+            scope=scope,
+            zone=zone,
+            anchor=full_anchor,
+            image_size=full_size,
+            source_key="full_gpt",
+        ):
+            finalized = _finalize_candidate(
+                guidance_client=guidance_client,
+                candidate=gpt_full,
+                target=canonical_target,
+                instruction=step_target.instruction,
+                anchor=full_anchor,
+                image_size=full_size,
+                scope=scope,
+                zone=zone,
+                source_key="full_gpt",
+                source_path=full_image_path,
+            )
+            if finalized is not None:
+                return finalized, "full_gpt", full_image_path
 
     return None
 
@@ -646,9 +1033,7 @@ def _finalize_candidate(
 def _needs_verification(target: str, detection: Detection, source_key: str) -> bool:
     if source_key.endswith("gpt"):
         return True
-    if detection.confidence < 0.45:
-        return True
-    if any(k in target for k in ["menu", "button", "key", "light", "screen", "cable", "charger"]):
+    if detection.confidence < 0.35:
         return True
     return False
 

@@ -36,6 +36,7 @@ def main() -> None:
         image_path=Path(image_path).expanduser(),
         issue_text=issue_text,
         config=config,
+        progress_callback=lambda message: print(f"[progress] {message}"),
     )
 
     print("\n--- Assistant Output ---")

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 @dataclass(frozen=True)
 class AppConfig:
     llm_backend: str
+    detector_mode: str
     openai_api_key: str | None
     openai_model: str
     yolo_model: str
@@ -17,6 +18,13 @@ class AppConfig:
     crop_padding_ratio: float
     output_dir: Path
     reply_dir: Path
+    openai_timeout_seconds: int
+    openai_max_image_side: int
+    openai_concurrency: int
+    step_workers: int
+    max_step_targets: int
+    ram_checkpoint: str | None
+    everything_max_tags: int
     local_vlm_model: str
 
     @classmethod
@@ -30,6 +38,7 @@ class AppConfig:
         resolved_reply = Path(os.getenv("KOSI_REPLY_DIR", "reply")).expanduser()
         return cls(
             llm_backend=os.getenv("KOSI_LLM_BACKEND", "openai").strip().lower(),
+            detector_mode=os.getenv("KOSI_DETECTOR_MODE", "yolo").strip().lower(),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
             yolo_model=os.getenv("YOLO_MODEL", "yolov8s-world.pt"),
@@ -37,5 +46,12 @@ class AppConfig:
             crop_padding_ratio=float(os.getenv("CROP_PADDING_RATIO", "0.15")),
             output_dir=resolved_output,
             reply_dir=resolved_reply,
+            openai_timeout_seconds=int(os.getenv("OPENAI_TIMEOUT_SECONDS", "25")),
+            openai_max_image_side=int(os.getenv("OPENAI_MAX_IMAGE_SIDE", "1800")),
+            openai_concurrency=int(os.getenv("OPENAI_CONCURRENCY", "2")),
+            step_workers=int(os.getenv("KOSI_STEP_WORKERS", "3")),
+            max_step_targets=int(os.getenv("KOSI_MAX_STEP_TARGETS", "4")),
+            ram_checkpoint=os.getenv("RAM_CHECKPOINT_PATH"),
+            everything_max_tags=int(os.getenv("KOSI_EVERYTHING_MAX_TAGS", "24")),
             local_vlm_model=os.getenv("LOCAL_VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct"),
         )
