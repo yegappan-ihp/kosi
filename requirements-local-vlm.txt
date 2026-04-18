@@ -1,0 +1,7 @@
+# Optional dependencies for fully local vision-language inference.
+# Keep this separate so hybrid mode dependencies remain stable.
+
+transformers>=4.44.0
+accelerate>=0.34.0
+torch>=2.3.0
+bitsandbytes>=0.43.0

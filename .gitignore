@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+outputs/
+output_files/
+reply/
+.venv/
+*.pt
